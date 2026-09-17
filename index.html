@@ -1,0 +1,47 @@
+<!doctype html>
+<html lang="zh-CN" class="dark">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>InviMeet - 会议副驾</title>
+    <script>
+      console.log("[InviMeet HTML] <head> script loaded:", {
+        url: window.location.href,
+        hasTauriInternals: typeof window.__TAURI_INTERNALS__ !== "undefined",
+        timestamp: new Date().toISOString()
+      });
+
+      window.addEventListener("error", function (e) {
+        console.error("[InviMeet Global Error]", e.message, e.filename, e.lineno, e.error);
+        const errDiv = document.getElementById("init-error-banner");
+        if (errDiv) {
+          errDiv.style.display = "block";
+          errDiv.innerText = "【前端加载报错】" + e.message + "\n来源: " + e.filename + ":" + e.lineno;
+        }
+      });
+
+      window.addEventListener("unhandledrejection", function (e) {
+        console.error("[InviMeet Unhandled Rejection]", e.reason);
+      });
+    </script>
+  </head>
+  <body class="bg-surface-darker text-slate-100 antialiased select-none overflow-hidden font-sans">
+    <div
+      id="init-error-banner"
+      style="display:none; position:fixed; top:0; left:0; right:0; z-index:999999; background:#e11d48; color:white; padding:16px; font-size:13px; font-family:monospace; word-break:break-all; border-bottom:2px solid #fff; box-shadow:0 10px 25px rgba(0,0,0,0.5);"
+    ></div>
+
+    <div id="root">
+      <!-- Fallback UI displayed immediately when HTML loads before React hydration -->
+      <div style="width:100vw; height:100vh; display:flex; flex-direction:column; align-items:center; justify-content:center; background:#0d1117; color:#94a3b8; font-family:-apple-system,BlinkMacSystemFont,sans-serif;">
+        <div style="width:36px; height:36px; border:3px solid #6366f1; border-top-color:transparent; border-radius:50%; animation:invi-spin 0.8s linear infinite; margin-bottom:16px;"></div>
+        <div style="font-size:14px; font-weight:600; color:#e2e8f0; letter-spacing:0.5px;">InviMeet 会议副驾正在启动...</div>
+        <div style="font-size:12px; color:#64748b; margin-top:8px;">正在加载双轨音频引擎与控制界面</div>
+      </div>
+      <style>
+        @keyframes invi-spin { to { transform: rotate(360deg); } }
+      </style>
+    </div>
+    <script type="module" src="/src/main.tsx"></script>
+  </body>
+</html>

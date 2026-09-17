@@ -1,0 +1,10 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>NSMicrophoneUsageDescription</key>
+    <string>InviMeet 需要访问您的麦克风以录制会议发言内容并实时生成字幕。</string>
+    <key>NSScreenCaptureUsageDescription</key>
+    <string>InviMeet 需要获取屏幕与系统音频录制权限以捕获会议对方扬声器声音并生成完整纪要。</string>
+</dict>
+</plist>

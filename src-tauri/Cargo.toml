@@ -1,0 +1,33 @@
+[package]
+name = "invimeet"
+version = "0.1.0"
+description = "InviMeet - PC AI Meeting Companion"
+authors = ["InviMeet Team"]
+edition = "2021"
+
+[lib]
+name = "invimeet_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = ["devtools", "macos-private-api", "tray-icon"] }
+tauri-plugin-opener = "2"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+tokio = { version = "1", features = ["full"] }
+chrono = { version = "0.4", features = ["serde"] }
+uuid = { version = "1.8", features = ["v4", "serde"] }
+cpal = "0.15"
+hound = "3.5"
+thiserror = "2.0"
+reqwest = { version = "0.12", features = ["json"] }
+
+[profile.release]
+panic = "abort"
+codegen-units = 1
+lto = true
+opt-level = "s"
+strip = true
