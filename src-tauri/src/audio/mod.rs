@@ -21,6 +21,10 @@ extern "C" {
     fn mac_stop_loopback_capture();
     fn mac_check_screen_capture_permission() -> bool;
     fn mac_request_screen_capture_permission() -> bool;
+    #[allow(dead_code)]
+    fn mac_start_voice_processing_mic(on_audio_data: Option<MacAudioCallback>) -> i32;
+    #[allow(dead_code)]
+    fn mac_stop_voice_processing_mic();
 }
 
 #[cfg(target_os = "macos")]
@@ -35,6 +39,55 @@ struct MacAudioSink {
 
 #[cfg(target_os = "macos")]
 static MAC_AUDIO_SINK: Mutex<Option<MacAudioSink>> = Mutex::new(None);
+#[cfg(target_os = "macos")]
+#[allow(dead_code)]
+static MAC_MIC_SINK: Mutex<Option<MacAudioSink>> = Mutex::new(None);
+
+#[cfg(target_os = "macos")]
+#[allow(dead_code)]
+extern "C" fn on_mac_mic_data(
+    samples_ptr: *const f32,
+    sample_count: i32,
+    channels: i32,
+    sample_rate: f64,
+) {
+    if samples_ptr.is_null() || sample_count <= 0 || channels <= 0 {
+        return;
+    }
+
+    let samples = unsafe { std::slice::from_raw_parts(samples_ptr, sample_count as usize) };
+
+    if let Ok(mut sink_guard) = MAC_MIC_SINK.lock() {
+        if let Some(sink) = sink_guard.as_mut() {
+            let sr = sample_rate as u32;
+            let ch = channels as usize;
+
+            let need_new = match &sink.resampler {
+                Some(r) => r.input_sample_rate != sr || r.channels != ch,
+                None => true,
+            };
+            if need_new {
+                sink.resampler = Some(AudioResampler::new(sr, ch));
+            }
+
+            if let Some(resampler) = &mut sink.resampler {
+                let (f32_mono, i16_samples, level) = resampler.process(samples);
+                sink.level_bits.store(level.to_bits(), Ordering::Relaxed);
+
+                if let Ok(mut w) = sink.writer.lock() {
+                    let _ = w.write_samples(&i16_samples);
+                }
+
+                let elapsed_ms = sink.start_time.elapsed().as_millis() as u64;
+                if let Ok(mut chunker) = sink.chunker.lock() {
+                    if let Some(chunk) = chunker.push_samples(&f32_mono, elapsed_ms) {
+                        let _ = sink.chunk_tx.try_send(chunk);
+                    }
+                }
+            }
+        }
+    }
+}
 
 #[cfg(target_os = "macos")]
 extern "C" fn on_mac_audio_data(
@@ -132,6 +185,8 @@ impl AudioEngine {
                 let mut speaker_file_path: Option<String> = None;
                 #[cfg(target_os = "macos")]
                 let mut mac_loopback_active = false;
+                #[cfg(target_os = "macos")]
+                let mut mac_vp_mic_active = false;
 
                 let mut active_mic_chunker: Option<Arc<Mutex<AudioChunker>>> = None;
                 let mut active_spk_chunker: Option<Arc<Mutex<AudioChunker>>> = None;
@@ -150,7 +205,11 @@ impl AudioEngine {
                             session_start = Some(start_inst);
                             active_chunk_tx = Some(chunk_tx.clone());
 
-                            let mic_chunker = Arc::new(Mutex::new(AudioChunker::new(SpeakerRole::Me)));
+                            // Attach speaker level reference to mic chunker for Cross-VAD acoustic echo ducking
+                            let mic_chunker = Arc::new(Mutex::new(AudioChunker::new_with_remote_ref(
+                                SpeakerRole::Me,
+                                Some(speaker_level_thread.clone()),
+                            )));
                             active_mic_chunker = Some(mic_chunker.clone());
 
                             let spk_chunker = Arc::new(Mutex::new(AudioChunker::new(SpeakerRole::Remote)));
@@ -169,9 +228,39 @@ impl AudioEngine {
                             };
 
                             let host = cpal::default_host();
+                            let mut mic_started = false;
 
-                            // 1. Microphone Input Stream (Common for macOS / Windows / Linux)
-                            if let Some(mic_device) = host.default_input_device() {
+                            // 1. Microphone Input Stream
+                            // Platform A: macOS Native VoiceProcessingIO (AEC + AGC with Minimized Ducking)
+                            #[cfg(target_os = "macos")]
+                            {
+                                if let Ok(mut sink_guard) = MAC_MIC_SINK.lock() {
+                                    *sink_guard = Some(MacAudioSink {
+                                        resampler: None,
+                                        writer: writer_mic.clone(),
+                                        level_bits: mic_level_thread.clone(),
+                                        chunker: mic_chunker.clone(),
+                                        chunk_tx: chunk_tx.clone(),
+                                        start_time: start_inst,
+                                    });
+                                }
+
+                                let vp_res = unsafe { mac_start_voice_processing_mic(Some(on_mac_mic_data)) };
+                                if vp_res == 0 {
+                                    mac_vp_mic_active = true;
+                                    mic_started = true;
+                                    println!("[InviMeet Audio] macOS VoiceProcessingIO 麦克风已成功启动（AEC 硬件回声消除生效，最小化音频闪避）");
+                                } else {
+                                    eprintln!("[InviMeet Audio 警告] VoiceProcessingIO 启动失败 (code: {})，回退至 cpal 默认麦克风", vp_res);
+                                    if let Ok(mut sink_guard) = MAC_MIC_SINK.lock() {
+                                        *sink_guard = None;
+                                    }
+                                }
+                            }
+
+                            // Platform B / Fallback: cpal default input device (Windows, Linux, or macOS fallback)
+                            if !mic_started {
+                                if let Some(mic_device) = host.default_input_device() {
                                 if let Ok(mic_config) = mic_device.default_input_config() {
                                     let sample_rate = mic_config.sample_rate().0;
                                     let channels = mic_config.channels() as usize;
@@ -235,6 +324,7 @@ impl AudioEngine {
                                         }
                                     }
                                 }
+                            }
                             }
 
                             // 2. Speaker Loopback Stream
@@ -490,6 +580,15 @@ impl AudioEngine {
                                     *sink_guard = None;
                                 }
                                 mac_loopback_active = false;
+                            }
+
+                            #[cfg(target_os = "macos")]
+                            if mac_vp_mic_active {
+                                unsafe { mac_stop_voice_processing_mic() };
+                                if let Ok(mut sink_guard) = MAC_MIC_SINK.lock() {
+                                    *sink_guard = None;
+                                }
+                                mac_vp_mic_active = false;
                             }
 
                             mic_level_thread.store(0.0f32.to_bits(), Ordering::SeqCst);

@@ -1,11 +1,12 @@
-import React, { useState, useEffect } from "react";
-import { Meeting, RecordingState, AppSettings, TranscriptSegment, LlmConfig, OllamaStatus } from "@/types/meeting";
+import React, { useState, useEffect, useRef } from "react";
+import { Meeting, RecordingState, AppSettings, TranscriptSegment, LlmConfig, OllamaStatus, SpeakerRole } from "@/types/meeting";
 import { TauriBridge } from "@/lib/tauriBridge";
 import { MeetingSidebar } from "@/components/MeetingSidebar";
 import { TranscriptStream } from "@/components/TranscriptStream";
 import { SummaryCard } from "@/components/SummaryCard";
 import { AudioWaveform } from "@/components/AudioWaveform";
 import { SettingsDialog } from "@/components/SettingsDialog";
+import { AudioPlayerBar } from "@/components/AudioPlayerBar";
 import {
   Play,
   Square,
@@ -50,6 +51,16 @@ export const MainWindow: React.FC = () => {
     autoSummaryOnStop: true,
     isMockMode: false,
   });
+
+  // Audio Playback States
+  const audioRef = useRef<HTMLAudioElement | null>(null);
+  const [audioTrack, setAudioTrack] = useState<SpeakerRole>("me");
+  const [isPlayingAudio, setIsPlayingAudio] = useState(false);
+  const [audioCurrentTimeMs, setAudioCurrentTimeMs] = useState(0);
+  const [audioDurationMs, setAudioDurationMs] = useState(0);
+  const [activePlayingSegmentId, setActivePlayingSegmentId] = useState<string | null>(null);
+  const [isPlayerOpen, setIsPlayerOpen] = useState(false);
+  const [playbackRate, setPlaybackRate] = useState(1.0);
 
   // Load meetings & state
   useEffect(() => {
@@ -297,6 +308,164 @@ export const MainWindow: React.FC = () => {
     return `${String(m).padStart(2, "0")}:${String(s).padStart(2, "0")}`;
   };
 
+  // Audio playback event listener management
+  useEffect(() => {
+    const audio = new Audio();
+    audioRef.current = audio;
+
+    const onTimeUpdate = () => {
+      const curMs = audio.currentTime * 1000;
+      setAudioCurrentTimeMs(curMs);
+
+      if (selectedMeeting?.segments) {
+        const segs = selectedMeeting.segments;
+        let matched: TranscriptSegment | null = null;
+        for (let i = 0; i < segs.length; i++) {
+          if (curMs >= segs[i].timestampMs) {
+            matched = segs[i];
+          } else {
+            break;
+          }
+        }
+        if (matched) {
+          setActivePlayingSegmentId(matched.id);
+        }
+      }
+    };
+
+    const onLoadedMetadata = () => {
+      if (audio.duration && !isNaN(audio.duration) && audio.duration !== Infinity) {
+        setAudioDurationMs(audio.duration * 1000);
+      } else if (selectedMeeting?.durationSeconds) {
+        setAudioDurationMs(selectedMeeting.durationSeconds * 1000);
+      }
+    };
+
+    const onEnded = () => {
+      setIsPlayingAudio(false);
+    };
+
+    const onPlay = () => setIsPlayingAudio(true);
+    const onPause = () => setIsPlayingAudio(false);
+
+    audio.addEventListener("timeupdate", onTimeUpdate);
+    audio.addEventListener("loadedmetadata", onLoadedMetadata);
+    audio.addEventListener("ended", onEnded);
+    audio.addEventListener("play", onPlay);
+    audio.addEventListener("pause", onPause);
+
+    return () => {
+      audio.pause();
+      audio.removeEventListener("timeupdate", onTimeUpdate);
+      audio.removeEventListener("loadedmetadata", onLoadedMetadata);
+      audio.removeEventListener("ended", onEnded);
+      audio.removeEventListener("play", onPlay);
+      audio.removeEventListener("pause", onPause);
+      audio.src = "";
+    };
+  }, [selectedMeeting]);
+
+  // When selectedMeeting changes, stop playback and reset player
+  useEffect(() => {
+    if (audioRef.current) {
+      audioRef.current.pause();
+      setIsPlayingAudio(false);
+      setAudioCurrentTimeMs(0);
+      setActivePlayingSegmentId(null);
+      if (selectedMeeting?.durationSeconds) {
+        setAudioDurationMs(selectedMeeting.durationSeconds * 1000);
+      }
+    }
+  }, [selectedMeeting?.id]);
+
+  const loadAndPlayTrack = async (track: SpeakerRole, startMs?: number) => {
+    if (!audioRef.current || !selectedMeeting) return;
+    const audio = audioRef.current;
+
+    const filePath = track === "me" ? selectedMeeting.audioFileMic : selectedMeeting.audioFileSpeaker;
+    const audioUrl = await TauriBridge.getAudioUrl(filePath, track);
+
+    if (audio.src !== audioUrl) {
+      audio.src = audioUrl;
+      audio.playbackRate = playbackRate;
+      await audio.load();
+    }
+
+    if (startMs !== undefined) {
+      audio.currentTime = Math.max(0, startMs / 1000);
+      setAudioCurrentTimeMs(startMs);
+    }
+
+    setAudioTrack(track);
+    setIsPlayerOpen(true);
+
+    try {
+      await audio.play();
+      setIsPlayingAudio(true);
+    } catch (err) {
+      console.warn("Audio play error:", err);
+    }
+  };
+
+  const handlePlaySegment = async (segment: TranscriptSegment) => {
+    if (!audioRef.current) return;
+
+    if (activePlayingSegmentId === segment.id && isPlayingAudio) {
+      audioRef.current.pause();
+      return;
+    }
+
+    setActivePlayingSegmentId(segment.id);
+    await loadAndPlayTrack(segment.speaker, segment.timestampMs);
+  };
+
+  const handleTogglePlayPause = () => {
+    if (!audioRef.current) return;
+    if (isPlayingAudio) {
+      audioRef.current.pause();
+    } else {
+      audioRef.current.play().catch(console.warn);
+    }
+  };
+
+  const handleSeekAudio = (timeMs: number) => {
+    if (!audioRef.current) return;
+    audioRef.current.currentTime = timeMs / 1000;
+    setAudioCurrentTimeMs(timeMs);
+  };
+
+  const handleSkipAudio = (offsetSec: number) => {
+    if (!audioRef.current) return;
+    const current = audioRef.current.currentTime;
+    const duration = audioRef.current.duration || 9999;
+    const newTime = Math.max(0, Math.min(duration, current + offsetSec));
+    audioRef.current.currentTime = newTime;
+    setAudioCurrentTimeMs(newTime * 1000);
+  };
+
+  const handleRateChange = (rate: number) => {
+    setPlaybackRate(rate);
+    if (audioRef.current) {
+      audioRef.current.playbackRate = rate;
+    }
+  };
+
+  const handleTrackChange = async (track: SpeakerRole) => {
+    if (track === audioTrack) return;
+    const currentMs = audioCurrentTimeMs;
+    await loadAndPlayTrack(track, currentMs);
+  };
+
+  const handleClosePlayer = () => {
+    if (audioRef.current) {
+      audioRef.current.pause();
+    }
+    setIsPlayerOpen(false);
+    setActivePlayingSegmentId(null);
+  };
+
+  const activeSegment = selectedMeeting?.segments.find((s) => s.id === activePlayingSegmentId);
+
   return (
     <div className="w-screen h-screen flex bg-surface-darker overflow-hidden text-slate-100 font-sans">
       {/* Sidebar */}
@@ -490,7 +659,26 @@ export const MainWindow: React.FC = () => {
               <TranscriptStream
                 segments={selectedMeeting?.segments || []}
                 isRecording={recordingState.isRecording && recordingState.activeMeetingId === selectedMeeting?.id}
+                activeSegmentId={activePlayingSegmentId}
+                isPlaying={isPlayingAudio}
+                onPlaySegment={handlePlaySegment}
               />
+              {isPlayerOpen && (
+                <AudioPlayerBar
+                  isPlaying={isPlayingAudio}
+                  currentTimeMs={audioCurrentTimeMs}
+                  durationMs={audioDurationMs}
+                  currentTrack={audioTrack}
+                  playbackRate={playbackRate}
+                  activeSegmentText={activeSegment?.text}
+                  onPlayPause={handleTogglePlayPause}
+                  onSeek={handleSeekAudio}
+                  onSkip={handleSkipAudio}
+                  onRateChange={handleRateChange}
+                  onTrackChange={handleTrackChange}
+                  onClose={handleClosePlayer}
+                />
+              )}
             </div>
           )}
 

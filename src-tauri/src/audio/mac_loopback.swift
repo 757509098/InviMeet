@@ -158,3 +158,118 @@ public func mac_request_screen_capture_permission() -> Bool {
     }
     return false
 }
+
+// MARK: - Native Voice Processing Microphone (AEC + AGC)
+
+@available(macOS 10.15, *)
+public class MacVoiceProcessingMic: NSObject, @unchecked Sendable {
+    public static let shared = MacVoiceProcessingMic()
+
+    private var engine: AVAudioEngine?
+    private var onAudioData: AudioDataCallback?
+    private var isRecording = false
+
+    private override init() {
+        super.init()
+    }
+
+    public func start(onAudioData: AudioDataCallback?) throws {
+        self.onAudioData = onAudioData
+        let engine = AVAudioEngine()
+        let inputNode = engine.inputNode
+
+        do {
+            try inputNode.setVoiceProcessingEnabled(true)
+            print("[MacVoiceProcessingMic] 硬件级声学回声消除 (AEC) 已成功开启")
+        } catch {
+            print("[MacVoiceProcessingMic] 警告：无法开启硬件 VoiceProcessingEnabled: \(error.localizedDescription)")
+        }
+
+        // 关键优化：最小化系统音频闪避 (Audio Ducking)，防止正在开会的扬声器声音被系统强行压低
+        if #available(macOS 14.0, *) {
+            var ducking = inputNode.voiceProcessingOtherAudioDuckingConfiguration
+            ducking.enableAdvancedDucking = false
+            ducking.duckingLevel = .min
+            inputNode.voiceProcessingOtherAudioDuckingConfiguration = ducking
+        }
+
+        // 将引擎自带的输出总线静音，避免引擎接管扬声器或注入音频
+        engine.mainMixerNode.outputVolume = 0.0
+
+        let inputFormat = inputNode.outputFormat(forBus: 0)
+        let sampleRate = inputFormat.sampleRate
+        let channels = Int(inputFormat.channelCount)
+
+        inputNode.installTap(onBus: 0, bufferSize: 1024, format: inputFormat) { [weak self] buffer, _ in
+            guard let self = self, self.isRecording else { return }
+            let frameLength = Int(buffer.frameLength)
+            guard frameLength > 0 else { return }
+
+            if let floatChannelData = buffer.floatChannelData {
+                if channels == 1 {
+                    self.onAudioData?(floatChannelData[0], Int32(frameLength), 1, sampleRate)
+                } else if channels > 1 {
+                    var interleaved = [Float](repeating: 0, count: frameLength * channels)
+                    for f in 0..<frameLength {
+                        for c in 0..<channels {
+                            interleaved[f * channels + c] = floatChannelData[c][f]
+                        }
+                    }
+                    interleaved.withUnsafeBufferPointer { ptr in
+                        if let base = ptr.baseAddress {
+                            self.onAudioData?(base, Int32(frameLength * channels), Int32(channels), sampleRate)
+                        }
+                    }
+                }
+            } else if let int16ChannelData = buffer.int16ChannelData {
+                var interleaved = [Float](repeating: 0, count: frameLength * channels)
+                for f in 0..<frameLength {
+                    for c in 0..<channels {
+                        interleaved[f * channels + c] = Float(int16ChannelData[c][f]) / 32768.0
+                    }
+                }
+                interleaved.withUnsafeBufferPointer { ptr in
+                    if let base = ptr.baseAddress {
+                        self.onAudioData?(base, Int32(frameLength * channels), Int32(channels), sampleRate)
+                    }
+                }
+            }
+        }
+
+        try engine.start()
+        self.engine = engine
+        self.isRecording = true
+    }
+
+    public func stop() {
+        if let engine = self.engine {
+            engine.inputNode.removeTap(onBus: 0)
+            engine.stop()
+            self.engine = nil
+        }
+        self.onAudioData = nil
+        self.isRecording = false
+    }
+}
+
+@_cdecl("mac_start_voice_processing_mic")
+public func mac_start_voice_processing_mic(onAudioData: AudioDataCallback?) -> Int32 {
+    guard #available(macOS 10.15, *) else {
+        return -2 // Unsupported OS
+    }
+
+    do {
+        try MacVoiceProcessingMic.shared.start(onAudioData: onAudioData)
+        return 0
+    } catch {
+        print("[MacVoiceProcessingMic] Failed to start:", error.localizedDescription)
+        return -1
+    }
+}
+
+@_cdecl("mac_stop_voice_processing_mic")
+public func mac_stop_voice_processing_mic() {
+    guard #available(macOS 10.15, *) else { return }
+    MacVoiceProcessingMic.shared.stop()
+}
+

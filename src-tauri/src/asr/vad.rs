@@ -31,17 +31,28 @@ pub struct AudioChunker {
     noise_floor: f32,
     voice_frames_count: usize,
     min_voice_onset_frames: usize,
+
+    // Cross-track speaker level reference for acoustic echo ducking
+    pub remote_level_ref: Option<std::sync::Arc<std::sync::atomic::AtomicU32>>,
+    remote_hold_samples: usize,
 }
 
 impl AudioChunker {
     pub fn new(speaker: SpeakerRole) -> Self {
+        Self::new_with_remote_ref(speaker, None)
+    }
+
+    pub fn new_with_remote_ref(
+        speaker: SpeakerRole,
+        remote_level_ref: Option<std::sync::Arc<std::sync::atomic::AtomicU32>>,
+    ) -> Self {
         let sample_rate = 16_000;
-        // 500ms of silence to mark the end of an utterance
-        let silence_threshold_samples = (sample_rate as f32 * 0.50) as usize;
+        // 750ms of silence to mark the end of an utterance (avoids splitting natural pauses)
+        let silence_threshold_samples = (sample_rate as f32 * 0.75) as usize;
         // Max 10 seconds per chunk to prevent delayed transcription
         let max_chunk_samples = (sample_rate as f32 * 10.0) as usize;
-        // Min 450ms to filter out ambient clicks/coughs/rustles
-        let min_chunk_samples = (sample_rate as f32 * 0.45) as usize;
+        // Min 400ms to filter out ambient clicks/coughs/rustles
+        let min_chunk_samples = (sample_rate as f32 * 0.40) as usize;
         // 250ms pre-roll to capture the onset of speech
         let max_pre_roll_samples = (sample_rate as f32 * 0.25) as usize;
 
@@ -69,6 +80,8 @@ impl AudioChunker {
             noise_floor: 0.0015,
             voice_frames_count: 0,
             min_voice_onset_frames: 2, // Require ~80ms sustained voice, rejecting single-frame clicks
+            remote_level_ref,
+            remote_hold_samples: 0,
         }
     }
 
@@ -87,7 +100,32 @@ impl AudioChunker {
         let rms = (sum_sq / samples.len() as f32).sqrt();
 
         // Adaptive threshold: must exceed 2.2x the current ambient noise floor
-        let dynamic_threshold = (self.noise_floor * 2.2).max(self.base_threshold);
+        let mut dynamic_threshold = (self.noise_floor * 2.2).max(self.base_threshold);
+
+        let mut remote_is_active = false;
+        if self.speaker == SpeakerRole::Me {
+            let remote_level = self
+                .remote_level_ref
+                .as_ref()
+                .map(|r| f32::from_bits(r.load(std::sync::atomic::Ordering::Relaxed)))
+                .unwrap_or(0.0);
+
+            // If remote speaker produces audio, keep a 500ms reverberation hold window
+            if remote_level > 0.020 {
+                self.remote_hold_samples = (self.sample_rate as f32 * 0.50) as usize;
+            } else {
+                self.remote_hold_samples = self.remote_hold_samples.saturating_sub(samples.len());
+            }
+
+            if remote_level > 0.020 || self.remote_hold_samples > 0 {
+                remote_is_active = true;
+                // Strong ducking gate: raised threshold easily blocks laptop speaker acoustic echo (~0.02-0.035)
+                // while cleanly permitting strong near-end voice (>0.04) for double-talk
+                let ducking_floor = 0.035 + (remote_level * 0.06).min(0.04);
+                dynamic_threshold = dynamic_threshold.max(ducking_floor);
+            }
+        }
+
         let is_voice = rms >= dynamic_threshold;
 
         if is_voice {
@@ -159,14 +197,21 @@ impl AudioChunker {
                     }
                 }
             } else {
-                // Track baseline noise floor using moving average during quiet periods
-                self.noise_floor = self.noise_floor * 0.98 + rms * 0.02;
+                // Track baseline noise floor using moving average only when remote speaker is quiet,
+                // preventing remote sound from artificially inflating the ambient noise floor.
+                if !remote_is_active {
+                    self.noise_floor = self.noise_floor * 0.98 + rms * 0.02;
+                }
 
-                // Maintain rolling pre-roll buffer
-                self.pre_roll_buffer.extend_from_slice(samples);
-                if self.pre_roll_buffer.len() > self.max_pre_roll_samples {
-                    let drain_count = self.pre_roll_buffer.len() - self.max_pre_roll_samples;
-                    self.pre_roll_buffer.drain(0..drain_count);
+                // Maintain rolling pre-roll buffer only during genuine quiet periods
+                if remote_is_active {
+                    self.pre_roll_buffer.clear();
+                } else {
+                    self.pre_roll_buffer.extend_from_slice(samples);
+                    if self.pre_roll_buffer.len() > self.max_pre_roll_samples {
+                        let drain_count = self.pre_roll_buffer.len() - self.max_pre_roll_samples;
+                        self.pre_roll_buffer.drain(0..drain_count);
+                    }
                 }
             }
         }
@@ -192,3 +237,54 @@ impl AudioChunker {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicU32, Ordering};
+    use std::sync::Arc;
+
+    #[test]
+    fn test_cross_vad_ducking_blocks_speaker_leakage() {
+        let remote_level = Arc::new(AtomicU32::new(0.0f32.to_bits()));
+        let mut chunker = AudioChunker::new_with_remote_ref(
+            SpeakerRole::Me,
+            Some(remote_level.clone()),
+        );
+
+        // Simulate speaker playing audio loudly (remote_level = 0.35)
+        remote_level.store(0.35f32.to_bits(), Ordering::Relaxed);
+
+        // Weak acoustic echo leakage frame (RMS ~ 0.012)
+        let echo_frame = vec![0.012f32; 640]; // 40ms at 16kHz
+        for i in 0..10 {
+            let chunk = chunker.push_samples(&echo_frame, (i * 40) as u64);
+            assert!(chunk.is_none(), "Speaker echo should NOT produce a chunk");
+        }
+
+        // Chunker must remain NOT in speech because dynamic threshold blocks echo
+        assert!(!chunker.is_in_speech, "Mic chunker should not enter speech mode during speaker playback");
+    }
+
+    #[test]
+    fn test_cross_vad_allows_strong_user_double_talk() {
+        let remote_level = Arc::new(AtomicU32::new(0.0f32.to_bits()));
+        let mut chunker = AudioChunker::new_with_remote_ref(
+            SpeakerRole::Me,
+            Some(remote_level.clone()),
+        );
+
+        // Remote speaker is playing
+        remote_level.store(0.20f32.to_bits(), Ordering::Relaxed);
+
+        // User speaks loudly into mic (RMS ~ 0.08)
+        let speech_frame = vec![0.08f32; 640];
+        // Feed frames to satisfy min_voice_onset_frames
+        for i in 0..5 {
+            let _ = chunker.push_samples(&speech_frame, (i * 40) as u64);
+        }
+
+        assert!(chunker.is_in_speech, "User speaking loudly should break through ducking (Double-Talk)");
+    }
+}
+

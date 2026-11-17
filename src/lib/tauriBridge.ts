@@ -3,6 +3,7 @@ import { listen, UnlistenFn } from "@tauri-apps/api/event";
 import {
   Meeting,
   TranscriptSegment,
+  SpeakerRole,
   RecordingState,
   AudioDeviceInfo,
   MeetingSummary,
@@ -149,6 +150,52 @@ const triggerMockEvent = (event: string, payload: any) => {
     cbs.forEach((cb) => cb(payload));
   }
 };
+
+// Audio ObjectURL Cache
+const audioUrlCache = new Map<string, string>();
+
+function writeString(view: DataView, offset: number, str: string) {
+  for (let i = 0; i < str.length; i++) {
+    view.setUint8(offset + i, str.charCodeAt(i));
+  }
+}
+
+function generateMockAudioWavUrl(speaker?: string): string {
+  const sampleRate = 16000;
+  const durationSec = 180; // 3 minutes mock track
+  const numSamples = sampleRate * durationSec;
+  const buffer = new ArrayBuffer(44 + numSamples * 2);
+  const view = new DataView(buffer);
+
+  // RIFF header
+  writeString(view, 0, "RIFF");
+  view.setUint32(4, 36 + numSamples * 2, true);
+  writeString(view, 8, "WAVE");
+  writeString(view, 12, "fmt ");
+  view.setUint32(16, 16, true);
+  view.setUint16(20, 1, true); // PCM
+  view.setUint16(22, 1, true); // 1 channel mono
+  view.setUint32(24, sampleRate, true);
+  view.setUint32(28, sampleRate * 2, true);
+  view.setUint16(32, 2, true); // Block align
+  view.setUint16(34, 16, true); // 16 bits
+  writeString(view, 36, "data");
+  view.setUint32(40, numSamples * 2, true);
+
+  const freq = speaker === "me" ? 360 : 500;
+  let offset = 44;
+  for (let i = 0; i < numSamples; i++) {
+    const t = i / sampleRate;
+    // Cadence modulation mimicking human speech phrases
+    const speechEnvelope = Math.sin(t * 3.5) > -0.2 ? 0.28 : 0.02;
+    const sample = Math.sin(2 * Math.PI * freq * t) * speechEnvelope;
+    view.setInt16(offset, sample < 0 ? sample * 0x8000 : sample * 0x7fff, true);
+    offset += 2;
+  }
+
+  const blob = new Blob([buffer], { type: "audio/wav" });
+  return URL.createObjectURL(blob);
+}
 
 export const TauriBridge = {
   // Listen to Tauri events (or mock fallback)
@@ -438,6 +485,45 @@ export const TauriBridge = {
       models: ["qwen2.5:7b", "qwen2.5:14b"],
       url: url || "http://127.0.0.1:11434",
     };
+  },
+
+  // Audio Playback File Loading & Cache
+  async readAudioFile(filePath: string): Promise<ArrayBuffer> {
+    if (isTauriEnv()) {
+      const bytes = await invoke<number[] | Uint8Array | ArrayBuffer>("read_audio_file", { filePath });
+      if (bytes instanceof ArrayBuffer) return bytes;
+      const u8 = bytes instanceof Uint8Array ? bytes : new Uint8Array(bytes as any);
+      return u8.buffer.slice(u8.byteOffset, u8.byteOffset + u8.byteLength) as ArrayBuffer;
+    }
+    throw new Error("readAudioFile is only supported in native Tauri runtime");
+  },
+
+  async getAudioUrl(filePath?: string, speaker?: SpeakerRole): Promise<string> {
+    if (filePath && audioUrlCache.has(filePath)) {
+      return audioUrlCache.get(filePath)!;
+    }
+
+    if (isTauriEnv() && filePath) {
+      try {
+        const buffer = await this.readAudioFile(filePath);
+        const blob = new Blob([buffer], { type: "audio/wav" });
+        const url = URL.createObjectURL(blob);
+        audioUrlCache.set(filePath, url);
+        return url;
+      } catch (err) {
+        console.warn(`[InviMeet Audio] Failed to read native audio '${filePath}':`, err);
+      }
+    }
+
+    // Fallback/Mock Audio generator for web preview or missing recordings
+    const fallbackKey = `mock-audio-${speaker || "me"}`;
+    if (audioUrlCache.has(fallbackKey)) {
+      return audioUrlCache.get(fallbackKey)!;
+    }
+
+    const mockUrl = generateMockAudioWavUrl(speaker);
+    audioUrlCache.set(fallbackKey, mockUrl);
+    return mockUrl;
   },
 
   // Export

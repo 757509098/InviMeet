@@ -45,10 +45,35 @@ pub async fn start_recording(
 
     tokio::spawn(async move {
         println!("[InviMeet ASR] 实时双轨 ASR 监听任务已启动，正在监听语音输入...");
+        // Ring buffer for echo deduplication: stores (remote_text, timestamp_ms) from the last 6s
+        let mut recent_remote_segments: Vec<(String, u64)> = Vec::new();
+
         while let Some(chunk) = chunk_rx.recv().await {
             let dur = chunk.samples.len() as f32 / 16_000.0;
             println!("[InviMeet ASR] 捕获到人声切片: 角色={:?}, 时长={:.2}s", chunk.speaker, dur);
             if let Some(segment) = asr_engine.transcribe_chunk(&chunk, &asr_meeting_id, &asr_app).await {
+                // Prune remote segments older than 6 seconds
+                recent_remote_segments.retain(|(_, ts)| segment.timestamp_ms.saturating_sub(*ts) < 6000);
+
+                if segment.speaker == crate::models::SpeakerRole::Remote {
+                    recent_remote_segments.push((segment.text.clone(), segment.timestamp_ms));
+                } else if segment.speaker == crate::models::SpeakerRole::Me {
+                    // Check if mic picked up an echo of the remote speaker
+                    let norm_me: String = segment.text.chars().filter(|c| c.is_alphanumeric()).collect();
+                    let is_echo_duplicate = !norm_me.is_empty() && recent_remote_segments.iter().any(|(remote_text, _)| {
+                        let norm_remote: String = remote_text.chars().filter(|c| c.is_alphanumeric()).collect();
+                        if norm_remote.is_empty() {
+                            return false;
+                        }
+                        norm_remote == norm_me || norm_remote.contains(&norm_me) || norm_me.contains(&norm_remote)
+                    });
+
+                    if is_echo_duplicate {
+                        println!("[InviMeet ASR 回声去重] 过滤麦克风录到的扬声器回声重复内容: [{}] '{}'", segment.speaker_label, segment.text);
+                        continue;
+                    }
+                }
+
                 println!("[InviMeet ASR] 广播转录文本气泡: [{}] {}", segment.speaker_label, segment.text);
                 let _ = asr_app.emit("transcript-segment", &segment);
                 asr_store.add_segment(&asr_meeting_id, segment).await;
@@ -242,5 +267,17 @@ pub async fn check_asr_model_status(app: AppHandle) -> Result<AsrModelStatus, St
 pub async fn download_asr_model(app: AppHandle) -> Result<(), String> {
     ModelManager::download_model(app).await
 }
+
+#[tauri::command]
+pub async fn read_audio_file(file_path: String) -> Result<Vec<u8>, String> {
+    let path = std::path::Path::new(&file_path);
+    if !path.exists() {
+        return Err(format!("Audio file not found: {}", file_path));
+    }
+    tokio::fs::read(path)
+        .await
+        .map_err(|e| format!("Failed to read audio file '{}': {}", file_path, e))
+}
+
 
 

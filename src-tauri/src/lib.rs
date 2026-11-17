@@ -96,6 +96,7 @@ pub fn run() {
             commands::check_ollama_status,
             commands::open_main_window,
             commands::toggle_pill_window,
+            commands::read_audio_file,
         ])
         .run(tauri::generate_context!())
         .expect("error while running InviMeet Tauri application");
